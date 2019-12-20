@@ -292,7 +292,7 @@ if __name__ == '__main__':
 
     ap = argparse.ArgumentParser(description="Convert a Twitter thread into a blog.",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument('tweeturls', nargs='+', help="Tweet URLs")
+    ap.add_argument('tweeturls', nargs='?', help="Tweet URLs")
 
     ap.add_argument('-c', '--config', default='~/.twitrc', help="Config file.")
     ap.add_argument('-o', '--outfile', default='./tweetblog.txt', help="Output file.")
