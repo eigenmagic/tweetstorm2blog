@@ -6,18 +6,16 @@ import sys
 import os.path
 import argparse
 import configparser
-import datetime
 import time
-import pprint
-import csv
 import pprint
 import collections
 
 from urllib.parse import urlparse
 import json
 
-import twitter
-import sqlite3
+import tweepy
+
+import pdb
 
 import logging
 logging.basicConfig(level=logging.DEBUG,
@@ -64,7 +62,7 @@ class TweetCache(object):
 
     def save_tweets(self, tweets):
         fd = open(self.filename, "w")
-        json.dump(tweets, fd)
+        json.dump([x._json for x in tweets], fd)
         fd.close()
 
 def api_delay(args):
@@ -119,20 +117,22 @@ def fetch_user_replies(tw, args, tweetcache, tweetid, screen_name=None):
     so there isn't one. ¯\_(ツ)_/¯
     """
     tweetlist = []
-    pp = pprint.PrettyPrinter(indent=2)
+    #pp = pprint.PrettyPrinter(indent=2)
 
     # If we don't have a screen name, it's because this is the
     # first recursive call, so fetch the tweet_id and parse it
     if screen_name is None:
-        tweet = tw.statuses.show(_id=tweetid,
-                            tweet_mode='extended',
-                            include_entities=True,
-                            trim_user=False,
-                            )
-        screen_name = tweet['user']['screen_name']
+        tweet = tw.get_status(tweetid,
+                          tweet_mode='extended',
+                          include_entities=True,
+                          trim_user=False,
+                          )
+        screen_name = tweet.user.screen_name
 
         tweetlist.append(tweet)
         #tweetdict[tweet['id']] = tweet
+
+        log.debug("Found tweet!")
 
     # Find replies by the author to this tweet
     # We use result_type of 'recent' to get an ordered list, but this
@@ -144,7 +144,7 @@ def fetch_user_replies(tw, args, tweetcache, tweetid, screen_name=None):
     while not finished:
         # First iteration
         if max_id is None:
-            results = tw.search.tweets(q="to:%s from:%s" % (screen_name, screen_name),
+            results = tw.search_tweets(q="to:%s from:%s" % (screen_name, screen_name),
                             since_id=since_id,
                             count=100,
                             tweet_mode='extended',
@@ -152,7 +152,7 @@ def fetch_user_replies(tw, args, tweetcache, tweetid, screen_name=None):
                             include_entities=True,
                             trim_user=True)
         else:
-            results = tw.search.tweets(q="to:%s from:%s" % (screen_name, screen_name),
+            results = tw.search_tweets(q="to:%s from:%s" % (screen_name, screen_name),
                             since_id=since_id,
                             max_id=max_id,
                             count=100,
@@ -161,16 +161,18 @@ def fetch_user_replies(tw, args, tweetcache, tweetid, screen_name=None):
                             include_entities=True,
                             trim_user=True)
 
-        tweets = results['statuses']
-        log.debug("Found %d tweet replies", len(tweets))
-        tweetlist.extend(tweets)
+        # log.debug("results: %s", pprint.pformat(results))
+        
+        log.debug("Found %d tweet replies", len(results))
+        
+        tweetlist.extend(results)
 
         # We found the maximum number of tweets, and there may be more, so we
         # need to find them.
-        if len(tweets) == 100:
+        if len(results) == 100:
             log.info("Max replies found. Fetch again with narrowed search window.")
             # Set the parameters for the next fetching iteration
-            max_id = min([x['id'] for x in tweets])
+            max_id = min([x.id for x in results])
             log.debug("max_id to fetch is: %s", max_id)
 
         else:
@@ -207,15 +209,16 @@ def get_thread(tw, args, tweetcache, start_tweetid):
     log.debug("Fetching tweets earlier in thread...")
     while(fetching):
         try:
-            tweet = tw.statuses.show(_id=tweetid,
-                                    tweet_mode='extended',
-                                    include_entities=True,
-                                    trim_user=True,
-                                    )
+            log.debug("Fetching tweet id: %s", tweetid)
+            tweet = tw.get_status(tweetid,
+                              tweet_mode='extended',
+                              include_entities=True,
+                              trim_user=True,
+                            )
             #tweetset = tw.statuses.lookup(_id=tweetid, trim_user=False)
             #tweet = tw.statuses.oembed(_id=tweetid, trim_user=True)
 
-            #log.debug("tweet: %s", pprint.pformat(tweet))
+            log.debug("tweet: %s", pprint.pformat(tweet))
             #log.debug("tweet: %s", json.dumps(json.loads('%s' % tweet), indent=4, sort_keys=True))
 
         except Exception as e:
@@ -225,11 +228,11 @@ def get_thread(tw, args, tweetcache, start_tweetid):
 
         twthread.append(tweet)
 
-        if tweet['in_reply_to_status_id'] is None:
+        if tweet.in_reply_to_status_id is None:
             fetching = False
             break
 
-        tweetid = tweet['in_reply_to_status_id']
+        tweetid = tweet.in_reply_to_status_id
         api_delay(args)
 
     # Try to find tweets later in the thread from this starting point
@@ -246,24 +249,99 @@ def blog_tweets(tweetlist):
     """
     # We're just going to sort the tweets into chronological order
     # and then print the text out.
+    tweetlist.sort(key=lambda tweet: tweet.id)
+    tweetlist = { x.id: x for x in tweetlist } 
 
-    tweetlist = { x['id']: x for x in tweetlist }
-    tweetlist = collections.OrderedDict(tweetlist)
+    # Sort the tweets by id so they're in (essentially) chronological order
+    # As of Python 3.7, regular dicts are guaranteed to be ordered
+    # tweetlist = collections.OrderedDict(tweetlist)
+
+    # Do we have multiple authors?
+    #authors = ', '.join([ x['user']['id_str'] for x in tweetlist.values()])
+    #log.debug(authors)
+
     log.debug("Creating blog from %d unique tweets.", len(tweetlist))
 
     # We might want to bulk-fetch the oembed data for these tweets instead?
 
-    blogtext = '\n'.join([ x['full_text'] for x in tweetlist.values()])
+    # Only add replies if they are to one of the tweets in the main thread
+    idlist = [sorted(tweetlist)[0]]
+    blogtext = tweet_as_html(tweetlist[idlist[0]]) + '\n'
+    for twtid in sorted(tweetlist)[1:]:
+        tweet = tweetlist[twtid]
+        if tweet.in_reply_to_status_id in idlist:
+            idlist.append(twtid)
+            blogtext += tweet_as_html(tweet) + '\n'
+        else:
+            log.debug(f"tweet not in reply to thread tweet, discarding: {tweet.full_text}")
+
+    #pdb.set_trace()
+    #blogtext = '\n'.join([ f"{x['created_at']}: {x['full_text']}" for x in tweetlist.values()])
+    #blogtext = '\n'.join([ f"{x['full_text']}" for x in tweetlist.values()])
+    # blogtext = '\n'.join([ tweet_as_html(x) for x in tweetlist.values()])
 
     # add a trailing newline
-    blogtext += '\n'
+    # blogtext += '\n'
     return blogtext
 
+def tweet_as_html(tw, quoted=False):
+    """Convert a tweet into blog-ready html"""
+    # log.debug("%s", pprint.pformat(tw))
+
+    full_text = tw.full_text
+    # Does this tweet have media entities?
+
+    if hasattr(tw, 'entities'):
+
+        if 'media' in tw.entities:
+            # We have media, so figure out where they are in the text
+            log.debug("Media found!")
+
+            # FIXME: This won't work if there's more than one piece of media.
+            for media in tw.entities['media']:
+                log.debug("media indices are: %s", media['indices'])
+                med_a = int(media['indices'][0])
+                med_b = int(media['indices'][1])
+
+                log.debug("text bits: %s", full_text[ med_a:med_b ])
+                #tweet_text[]
+                # We always slice out the shortcode URLs
+                new_text = full_text[:med_a]
+
+                # Replace the shortcode media URL with the actual URL as an html image
+                if 'photo' in media['type']:
+                    log.debug("Media is a photo.")
+                    new_text += f"""<img src="{media['media_url_https']}"/>"""
+
+                new_text += full_text[med_b:]
+                full_text = new_text
+
+        if 'urls' in tw.entities:
+            #log.debug("URLs found")
+            for url in tw.entities['urls']:
+                idx_a = int(url['indices'][0])
+                idx_b = int(url['indices'][1])
+                new_text = full_text[:idx_a]
+                new_text += f"""<a href="{url['expanded_url']}">{url['expanded_url']}</a>"""
+                new_text += full_text[idx_b:]
+                full_text = new_text
+
+    log.debug("Full text rewritten to: %s", full_text)
+
+    if hasattr(tw, 'quoted_status'):
+        log.debug("Found quoted status.")
+        quoted_text = tweet_as_html(tw.quoted_status, quoted=True)
+        retstr = f'<p>{full_text}<p class="quoted">{quoted_text}</p></p>'
+    else:
+        retstr = f"<p>{full_text}</p>"
+
+    return retstr
+    
 def augment_args(args):
     """
     Augment commandline arguments with config file parameters
     """
-    cp = configparser.SafeConfigParser()
+    cp = configparser.ConfigParser()
     cp.read(os.path.expanduser(args.config))
 
     return args
@@ -274,25 +352,28 @@ def authenticate(args):
     Twitter() object to use for API calls
     """
     # import the config file
-    cp = configparser.SafeConfigParser()
+    cp = configparser.ConfigParser()
     cp.read(os.path.expanduser(args.config))
 
-    token = cp.get('twitter', 'token')
-    token_key = cp.get('twitter', 'token_key')
-    con_secret = cp.get('twitter', 'con_secret')
-    con_secret_key = cp.get('twitter', 'con_secret_key')
+    access_token = cp.get('twitter', 'access_token')
+    access_token_secret = cp.get('twitter', 'access_token_secret')
+    consumer_secret = cp.get('twitter', 'consumer_secret')
+    consumer_key = cp.get('twitter', 'consumer_key')
 
-    tw = twitter.Twitter(auth=twitter.OAuth(token,
-                                            token_key,
-                                            con_secret,
-                                            con_secret_key))
+    auth = tweepy.OAuth1UserHandler(
+        consumer_key, consumer_secret,
+        access_token, access_token_secret
+        )
+
+    tw = tweepy.API(auth)
+
     return tw
 
 if __name__ == '__main__':
 
     ap = argparse.ArgumentParser(description="Convert a Twitter thread into a blog.",
                                  formatter_class=argparse.ArgumentDefaultsHelpFormatter)
-    ap.add_argument('tweeturls', nargs='?', help="Tweet URLs")
+    ap.add_argument('tweeturls', nargs='+', help="Tweet URLs")
 
     ap.add_argument('-c', '--config', default='~/.twitrc', help="Config file.")
     ap.add_argument('-o', '--outfile', default='./tweetblog.txt', help="Output file.")
@@ -325,10 +406,7 @@ if __name__ == '__main__':
     else:
         tweetlist = tweetcache.get_tweets()
 
-    # Sort the tweets by id so they're in (essentially) chronological order
-    tweetlist.sort(key=lambda tweet: tweet['id'])
-
-    # Write them out to our outfile as text
+    # Write tweets out to our outfile as text
     with open(args.outfile, 'w') as fp:
         fp.write(blog_tweets(tweetlist))
 
